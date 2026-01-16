@@ -5,6 +5,7 @@ Scrapes cinema websites for special events (Q&As, 35mm screenings, etc.)
 
 import os
 import json
+import re
 from pathlib import Path
 from typing import List, Optional
 from dotenv import load_dotenv
@@ -83,10 +84,13 @@ def get_api_key(key_name: str, fallback_key_name: Optional[str] = None) -> str:
 class ScreeningEvent(BaseModel):
     """Represents a cinema screening event."""
     film_title: str = Field(description="The title of the film being screened")
-    showtime: str = Field(description="The showtime in its original format (e.g., 'Fri, Jan 15, 7:00 PM')")
-    is_special_event: bool = Field(description="True if the event mentions Q&A, Director, 35mm, 70mm, or Premiere")
+    showtime: str = Field(description="The time only (e.g., '2:50pm', '7:00 PM') extracted from raw_date_time")
+    is_special_event: bool = Field(description="Always true for Special Events page")
     special_guest: Optional[str] = Field(default=None, description="Name of special guest if present (e.g., 'Sean Baker')")
     format: Optional[str] = Field(default=None, description="Film format if special (e.g., '35mm', '70mm')")
+    notes: Optional[str] = Field(default=None, description="Additional notes or metadata about the event")
+    date: Optional[str] = Field(default=None, description="The specific date in YYYY-MM-DD format (e.g., '2026-01-17'). Parsed from raw_date_time.")
+    raw_date_time: Optional[str] = Field(default=None, description="The complete date and time string as it appears on the page (e.g., 'Saturday January 17, 2:50pm')")
 
 
 
@@ -128,6 +132,338 @@ def scrape_calendar(url: str) -> str:
     return markdown_content
 
 
+def detect_date_header(line: str, next_lines: List[str]) -> Optional[str]:
+    """
+    Detect if a line (or pair of lines) matches a date header.
+    
+    STRICT REQUIREMENT: Must contain a day number (1-31) to be valid.
+    Returns None for incomplete dates like "Saturday January" (no day number).
+    
+    Args:
+        line: Current line
+        next_lines: Next 1-3 non-empty lines for look-ahead
+        
+    Returns:
+        Complete date string if detected (e.g., "Friday, January 16"), None otherwise
+    """
+    # Valid weekday keywords
+    weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+                "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    
+    # Valid month keywords
+    months = ["January", "February", "March", "April", "May", "June", "July", "August",
+              "September", "October", "November", "December",
+              "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    
+    def is_weekday(text: str) -> Optional[str]:
+        """Check if text contains a weekday (exact match or pattern match at start)."""
+        text_clean = text.strip().rstrip(',').lower()
+        # DEBUG: Show internal processing
+        print(f"    [is_weekday] text_clean: '{text_clean}'")
+        for weekday in weekdays:
+            weekday_lower = weekday.lower()
+            # Exact match (e.g., "fri" or "fri,")
+            if text_clean == weekday_lower or text_clean == weekday_lower + ',':
+                print(f"    [is_weekday] Exact match: '{text_clean}' == '{weekday_lower}'")
+                return weekday
+            # Pattern match: line starts with weekday (e.g., "fri jan 16" → matches "fri")
+            # Use word boundary or space after weekday to avoid partial matches
+            if text_clean.startswith(weekday_lower + ' ') or text_clean.startswith(weekday_lower + ','):
+                print(f"    [is_weekday] Pattern match: '{text_clean}'.startswith('{weekday_lower} ')")
+                return weekday
+        print(f"    [is_weekday] No match found for '{text_clean}'")
+        return None
+    
+    def find_month(text: str) -> Optional[str]:
+        text_lower = text.lower()
+        for month in months:
+            pattern = r'\b' + re.escape(month.lower()) + r'\b'
+            if re.search(pattern, text_lower):
+                return month
+        return None
+    
+    def find_day_number(text: str) -> Optional[str]:
+        """Find day number (1-31) in text. Returns the day if found."""
+        match = re.search(r'\b([1-9]|[12][0-9]|3[01])\b', text)
+        if match:
+            return match.group(1)
+        return None
+    
+    def has_day_number(text: str) -> bool:
+        """Check if text contains a day number (1-31). CRITICAL for validation."""
+        return find_day_number(text) is not None
+    
+    # DEBUG: Print raw line with quotes to see exact format
+    print(f"DEBUG: Checking line: '{line}'")
+    
+    line_stripped = line.strip()
+    
+    # DEBUG: Extract first token
+    first_token = line_stripped.split()[0] if line_stripped.split() else ""
+    print(f" -> First token: '{first_token}'")
+    
+    # DEBUG: Check if line looks like it might be a date header
+    # Pre-compute these for both debug prints and later use
+    line_lower = line_stripped.lower() if line_stripped else ""
+    first_word = line_lower.split()[0] if line_lower.split() else ""
+    has_weekday_keyword = any(wd.lower() == first_word for wd in weekdays) if line_stripped else False
+    has_month_keyword = any(month.lower() in line_lower for month in months) if line_stripped else False
+    has_digit = bool(re.search(r'\d', line_stripped)) if line_stripped else False
+    
+    # Print debug info for potential date lines
+    if line_stripped and (has_weekday_keyword or has_month_keyword or has_digit):
+        print(f"🔍 DEBUG: Checking potential date line: '{line_stripped}'")
+        print(f"   └─ first_word: '{first_word}', has_weekday_keyword: {has_weekday_keyword}, has_month_keyword: {has_month_keyword}, has_digit: {has_digit}")
+    
+    # CRITICAL CHECK: Line must contain a day number (1-31) to be valid
+    # This prevents returning incomplete dates like "Saturday January"
+    if not has_day_number(line_stripped):
+        # Check if any of the next lines have a day number
+        has_day_in_next_lines = False
+        for next_line in next_lines[:3]:
+            if has_day_number(next_line):
+                has_day_in_next_lines = True
+                break
+        
+        # If neither current line nor next lines have a day number, return None
+        if not has_day_in_next_lines:
+            if has_weekday_keyword or has_month_keyword:
+                print(f"   └─ ❌ REJECTED: Missing day number")
+            return None  # Incomplete date - missing day number
+    
+    # Check if line contains weekday
+    # DEBUG: Show is_weekday call with first token
+    weekday = is_weekday(line_stripped)
+    print(f" -> is_weekday('{line_stripped}') returned: {weekday}")
+    if has_weekday_keyword or has_month_keyword or has_digit:
+        print(f"   └─ is_weekday result: {weekday}")
+    
+    if weekday:
+        # Check if weekday line itself has month and day (single-line date)
+        month = find_month(line_stripped)
+        day = find_day_number(line_stripped)
+        if has_weekday_keyword or has_month_keyword or has_digit:
+            print(f"   └─ find_month result: {month}, find_day_number result: {day}")
+        if month and day:
+            result = f"{weekday} {month} {day}"
+            if has_weekday_keyword or has_month_keyword or has_digit:
+                print(f"   └─ ✅ MATCHED: {result}")
+            return result  # Complete date
+        
+        # Look ahead at next lines for month and day
+        date_parts = [weekday]
+        month_found = None
+        day_found = None
+        
+        # First, check if weekday line itself has month
+        month = find_month(line_stripped)
+        if month:
+            month_found = month
+            date_parts.append(month)
+            # If month found on same line, also check for day on same line
+            day = find_day_number(line_stripped)
+            if day:
+                day_found = day
+                date_parts.append(day)
+                return ' '.join(date_parts)  # Complete: weekday + month + day
+        
+        # If month found but no day yet, MUST check next lines for day
+        if month_found and not day_found:
+            for next_line in next_lines[:3]:  # Check up to 3 next lines
+                next_stripped = next_line.strip()
+                if not next_stripped:
+                    continue
+                
+                day = find_day_number(next_stripped)
+                if day:
+                    day_found = day
+                    date_parts.append(day)
+                    return ' '.join(date_parts)  # Complete: weekday + month + day
+        
+        # If no month found on weekday line, check next lines for month
+        if not month_found:
+            for next_line in next_lines[:3]:  # Check up to 3 next lines
+                next_stripped = next_line.strip()
+                if not next_stripped:
+                    continue
+                
+                month = find_month(next_stripped)
+                day = find_day_number(next_stripped)
+                
+                if month:
+                    month_found = month
+                    date_parts.append(month)
+                    # If month found, MUST find day (on same line or next)
+                    if day:
+                        day_found = day
+                        date_parts.append(day)
+                        return ' '.join(date_parts)  # Complete: weekday + month + day
+                    else:
+                        # Month found but day not on same line - check next line
+                        for next_next_line in next_lines[next_lines.index(next_line) + 1:]:
+                            next_next_stripped = next_next_line.strip()
+                            if not next_next_stripped:
+                                continue
+                            day = find_day_number(next_next_stripped)
+                            if day:
+                                day_found = day
+                                date_parts.append(day)
+                                return ' '.join(date_parts)  # Complete: weekday + month + day
+                        # Month found but day not found - invalid date
+                        return None
+        
+        # CRITICAL: If we found month but not day, return None (not incomplete date)
+        if month_found and not day_found:
+            return None
+        
+        # If we only have weekday, not valid
+        return None
+    
+    # Check for month + day without weekday (e.g., "February 9")
+    month = find_month(line_stripped)
+    if month:
+        day = find_day_number(line_stripped)
+        if day:
+            return f"{month} {day}"  # Complete date
+        
+        # Month found but no day on same line - check next lines
+        for next_line in next_lines[:3]:
+            next_stripped = next_line.strip()
+            if not next_stripped:
+                continue
+            day = find_day_number(next_stripped)
+            if day:
+                return f"{month} {day}"  # Complete date
+        # Month found but day not found - invalid
+        return None
+    
+    return None
+
+
+def parse_date_to_iso(date_str: str) -> Optional[str]:
+    """
+    Convert date string to ISO format (YYYY-MM-DD) for Supabase.
+    
+    Handles formats like:
+    - 'Fri Jan 16' (with weekday)
+    - 'Jan 16' (without weekday)
+    - 'Friday January 16' (full names)
+    - 'January 16' (full month, no weekday)
+    
+    Args:
+        date_str: Date string in various formats
+        
+    Returns:
+        ISO date string (e.g., "2026-01-16") or None if parsing fails
+    """
+    from datetime import datetime
+    
+    if not date_str:
+        return None
+    
+    # Current year (2026)
+    current_year = 2026
+    
+    # Month name to number mapping
+    month_map = {
+        'january': 1, 'jan': 1,
+        'february': 2, 'feb': 2,
+        'march': 3, 'mar': 3,
+        'april': 4, 'apr': 4,
+        'may': 5,
+        'june': 6, 'jun': 6,
+        'july': 7, 'jul': 7,
+        'august': 8, 'aug': 8,
+        'september': 9, 'sep': 9,
+        'october': 10, 'oct': 10,
+        'november': 11, 'nov': 11,
+        'december': 12, 'dec': 12
+    }
+    
+    # Extract month and day using regex
+    # Pattern: month name (full or abbrev) followed by day number
+    # This pattern ignores weekday names (Mon, Fri, Monday, Friday, etc.)
+    month_pattern = r'\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b'
+    day_pattern = r'\b([1-9]|[12][0-9]|3[01])\b'
+    
+    date_lower = date_str.lower()
+    
+    # Find month
+    month_match = re.search(month_pattern, date_lower)
+    if not month_match:
+        return None
+    
+    month_name = month_match.group(1)
+    month_num = month_map.get(month_name)
+    if not month_num:
+        return None
+    
+    # Find day - look for number after the month
+    # Get the position after the month match
+    search_start = month_match.end()
+    day_match = re.search(day_pattern, date_str[search_start:])
+    
+    if not day_match:
+        # Try searching the whole string
+        day_match = re.search(day_pattern, date_str)
+    
+    if not day_match:
+        return None
+    
+    day = int(day_match.group(1))
+    
+    # Build ISO date string
+    try:
+        iso_date = f"{current_year}-{month_num:02d}-{day:02d}"
+        # Validate the date
+        datetime.strptime(iso_date, '%Y-%m-%d')
+        return iso_date
+    except (ValueError, AttributeError):
+        return None
+
+
+def is_special_event_strict(notes: Optional[str], special_guest: Optional[str]) -> bool:
+    """
+    Determine if an event is special using strict keyword matching.
+    
+    REQUIRED KEYWORDS: 'Q&A', 'In Person', 'Appearing', 'Guest', 'Book Signing'
+    EXCLUDE: 'Introduction to' without 'In Person'
+    
+    Args:
+        notes: Notes/metadata text
+        special_guest: Special guest name if present
+        
+    Returns:
+        True if event matches strict special event criteria
+    """
+    # Check if special_guest exists (this is a strong indicator)
+    if special_guest:
+        return True
+    
+    # Check notes field for required keywords
+    if not notes:
+        return False
+    
+    notes_lower = notes.lower()
+    
+    # Required keywords (any of these)
+    required_keywords = ['q&a', 'in person', 'appearing', 'guest', 'book signing']
+    
+    # Check for required keywords
+    has_required_keyword = any(keyword in notes_lower for keyword in required_keywords)
+    
+    if not has_required_keyword:
+        return False
+    
+    # Exclude: "Introduction to" without "In Person"
+    if 'introduction to' in notes_lower:
+        # If it has "Introduction to", it MUST also have "In Person" to be special
+        if 'in person' not in notes_lower:
+            return False
+    
+    return True
+
+
 def analyze_with_openai(markdown_content: str) -> List[ScreeningEvent]:
     """
     Use OpenAI to extract ScreeningEvent objects from the scraped markdown.
@@ -145,27 +481,32 @@ def analyze_with_openai(markdown_content: str) -> List[ScreeningEvent]:
     client = OpenAI(api_key=api_key)
     
     # Processing the full page content
-    # Create the prompt
-    prompt = f"""Analyze the following cinema calendar page and extract screening events.
+    # Create the prompt for Special Events page
+    prompt = f"""Analyze the following Special Events page and extract all events.
 
-For each event, determine:
-- The film title
-- The showtime: Extract the Time exactly as it appears on the line (e.g., "7:00 PM", "8:30pm", "9:15 PM"). Do NOT try to combine with date headers. Just use the time as shown.
-- Whether it's a special event (true if it mentions: Q&A, Director, 35mm, 70mm, Premiere, Intro, or similar special programming)
-- Any special guest name (if mentioned)
-- The film format (if it's 35mm, 70mm, DCP, etc.)
+Each event block typically contains:
+- Film title (the main heading)
+- Date & Time string (e.g., "Saturday January 17, 2:50pm", "Friday, January 16, 7:00 PM")
+- Notes/Description (e.g., "Q&A with director...", "Introduction by...")
+- Additional metadata (director, year, format, etc.)
 
-**Extraction Rules:**
-- Look for any line with a time + movie title.
-- If it mentions a guest, Q&A, or special format, keep it.
-- If you are unsure, **KEEP IT**.
-- **Quantity is the priority.** Capture ALL special events.
+For each event, extract:
+- film_title: The main title/heading of the event
+- raw_date_time: The complete date and time string as it appears (e.g., "Saturday January 17, 2:50pm")
+- notes: The description/notes text (e.g., "Q&A with director Iva Radivojević...")
+- special_guest: Any special guest name if mentioned
+- format: Film format if mentioned (35mm, 70mm, etc.)
 
-Here is the calendar content:
+**Important:**
+- Extract ALL events from the page.
+- All events on this page are special events (is_special_event = true).
+- The raw_date_time field should contain the full date/time string exactly as it appears on the page.
+
+Here is the page content:
 
 {markdown_content}
 
-Extract screening events and return them as a JSON array of ScreeningEvent objects."""
+Extract all screening events and return them as a JSON array of ScreeningEvent objects."""
 
     # Use structured outputs with Pydantic model
     # Create a wrapper model for the list since parse expects a single model
@@ -179,29 +520,26 @@ Extract screening events and return them as a JSON array of ScreeningEvent objec
         messages=[
             {
                 "role": "system",
-                "content": """You are a film expert extracting events from a theater calendar.
-Your goal is High Recall: if an event looks even slightly special, include it.
+                "content": """You are a data extraction engine for Special Events pages.
 
 INSTRUCTIONS:
-1. Extract any movie event that mentions:
-   - A Guest (Q&A, Intro, In Attendance)
-   - A specific Format (35mm, 70mm, 16mm, 4k Restoration)
-   - A Special Event type (Premiere, Party, Book Signing)
-2. If you are unsure if it is special, INCLUDE IT.
-3. Extract the `showtime` exactly as written in the text (e.g. "7:00pm"). Do not try to find the date.
-4. Return a valid JSON object with this structure:
-{
-  "events": [
-    {
-      "film_title": "Title",
-      "showtime": "7:00pm",
-      "is_special_event": true,
-      "special_guest": "Name or None",
-      "format": "Format or None",
-      "description": "Short snippet explaining why it's special"
-    }
-  ]
-}
+1. **Extract ALL Events:** Read the entire page and extract every single event block.
+2. **Extract Fields:**
+   - film_title: The main title/heading of the event
+   - raw_date_time: The complete date and time string exactly as it appears (e.g., "Saturday January 17, 2:50pm")
+   - notes: The description/notes text if present
+   - special_guest: Any special guest name if mentioned
+   - format: Film format if mentioned (35mm, 70mm, etc.)
+3. **Special Events:**
+   - All events on this page are special events (is_special_event = true).
+4. **Output Format:**
+   - Extract the raw_date_time string exactly as shown on the page.
+   - The date field will be parsed separately in Python.
+
+MANDATORY:
+- Extract ALL events from the page.
+- Do not skip any events.
+- Preserve the raw_date_time string exactly as it appears.
 """
             },
             {
@@ -210,8 +548,8 @@ INSTRUCTIONS:
             }
         ],
         response_format=EventsResponse,
-        temperature=0.3,
-        timeout=30.0,
+        temperature=0,
+        timeout=300,
     )
     
     # Parse the response
@@ -287,21 +625,25 @@ def main():
         print("\n⚠️  Warning: OpenAI API key not found!")
         print("   Looking for: EXPO_PUBLIC_OPENAI_API_KEY")
     
-    # Step 1: Scrape the calendar
-    print("\n📡 Scraping Metrograph calendar...")
-    url = "https://metrograph.com/calendar"
+    # Step 1: Scrape the Special Events page
+    print("\n📡 Scraping Metrograph Special Events page...")
+    url = "https://metrograph.com/events/"
     
     try:
         markdown_content = scrape_calendar(url)
         print(f"✅ Successfully scraped {len(markdown_content)} characters")
+        
     except Exception as e:
         print(f"❌ Error scraping URL: {e}")
         return
     
-    # Step 2: Analyze with OpenAI
+    # Use the raw markdown content directly (no preprocessing needed for Special Events page)
+    processed_text = markdown_content
+    
+    # Step 3: Analyze with OpenAI
     print("\n🤖 Analyzing content with OpenAI...")
     try:
-        events = analyze_with_openai(markdown_content)
+        events = analyze_with_openai(processed_text)
         print(f"✅ Extracted {len(events)} screening events")
     except Exception as e:
         print(f"❌ Error analyzing content: {e}")
@@ -333,17 +675,66 @@ def main():
         
         supabase: Client = create_client(supabase_url, supabase_key)
         
-        # Prepare data for upsert
+        # Prepare data for upsert (all events on Special Events page are special events)
         events_data = []
         for event in events:
+            # All events on Special Events page are special events
+            print(f"✅ Saving Special Event: {event.film_title}")
+            
+            # Parse raw_date_time into date and time
+            date_iso = None
+            showtime = event.showtime  # Default to AI-extracted showtime
+            
+            # Parse date and time from raw_date_time if available
+            raw_date_time = getattr(event, 'raw_date_time', None)
+            if raw_date_time:
+                # Example formats: "Saturday January 17, 2:50pm", "Friday, January 16, 7:00 PM"
+                # Extract date part (before the comma + time)
+                # Try to split on comma before time
+                date_time_match = re.search(r'([A-Za-z]+(?:\s+[A-Za-z]+)?\s+\d{1,2}(?:st|nd|rd|th)?)\s*,\s*([\d:]+(?:\s*[ap]m)?)', raw_date_time, re.IGNORECASE)
+                if date_time_match:
+                    date_part = date_time_match.group(1)  # e.g., "Saturday January 17th"
+                    time_part = date_time_match.group(2)  # e.g., "2:50pm"
+                    # Parse date to ISO format
+                    date_iso = parse_date_to_iso(date_part)
+                    # Use extracted time as showtime
+                    showtime = time_part.strip()
+                else:
+                    # Fallback: try to extract date from raw_date_time string
+                    date_iso = parse_date_to_iso(raw_date_time)
+                    # If we can't split cleanly, try to extract just the time
+                    time_match = re.search(r'([\d:]+(?:\s*[ap]m)?)', raw_date_time, re.IGNORECASE)
+                    if time_match:
+                        showtime = time_match.group(1).strip()
+            
+            # Priority: Use event.date if AI already extracted it
+            if hasattr(event, 'date') and event.date:
+                date_iso = event.date
+                print(f"   (Date from AI: {date_iso})")
+            elif date_iso:
+                print(f"   (Date parsed from raw_date_time: {date_iso})")
+            
+            if showtime:
+                print(f"   (Showtime: {showtime})")
+            
             event_dict = {
                 "film_title": event.film_title,
-                "showtime": event.showtime,
+                "showtime": showtime or event.showtime,  # Use parsed time or fallback to AI showtime
                 "theater_name": THEATER_NAME,
-                "is_special_event": event.is_special_event,
+                "is_special_event": True,  # All events on Special Events page are special
                 "special_guest": event.special_guest,
                 "format": event.format,
             }
+            
+            # Add date field (ISO format for Supabase DATE column)
+            if date_iso:
+                event_dict["date"] = date_iso
+            
+            # Add notes field if present
+            notes = getattr(event, 'notes', None)
+            if notes:
+                event_dict["notes"] = notes
+            
             events_data.append(event_dict)
         
         # Upsert to Supabase
