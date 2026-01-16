@@ -150,10 +150,16 @@ def analyze_with_openai(markdown_content: str) -> List[ScreeningEvent]:
 
 For each event, determine:
 - The film title
-- The showtime (keep the original format)
-- Whether it's a special event (true if it mentions: Q&A, Director, 35mm, 70mm, Premiere, or similar special programming)
+- The showtime: Extract the Time exactly as it appears on the line (e.g., "7:00 PM", "8:30pm", "9:15 PM"). Do NOT try to combine with date headers. Just use the time as shown.
+- Whether it's a special event (true if it mentions: Q&A, Director, 35mm, 70mm, Premiere, Intro, or similar special programming)
 - Any special guest name (if mentioned)
 - The film format (if it's 35mm, 70mm, DCP, etc.)
+
+**Extraction Rules:**
+- Look for any line with a time + movie title.
+- If it mentions a guest, Q&A, or special format, keep it.
+- If you are unsure, **KEEP IT**.
+- **Quantity is the priority.** Capture ALL special events.
 
 Here is the calendar content:
 
@@ -173,7 +179,30 @@ Extract screening events and return them as a JSON array of ScreeningEvent objec
         messages=[
             {
                 "role": "system",
-                "content": "You are a strict filter. ONLY extract events where `is_special_event` is TRUE. If a movie is just a standard screening, DO NOT include it in the JSON output at all. Ignore it completely. Return a JSON object with an 'events' array containing only special events."
+                "content": """You are a film expert extracting events from a theater calendar.
+Your goal is High Recall: if an event looks even slightly special, include it.
+
+INSTRUCTIONS:
+1. Extract any movie event that mentions:
+   - A Guest (Q&A, Intro, In Attendance)
+   - A specific Format (35mm, 70mm, 16mm, 4k Restoration)
+   - A Special Event type (Premiere, Party, Book Signing)
+2. If you are unsure if it is special, INCLUDE IT.
+3. Extract the `showtime` exactly as written in the text (e.g. "7:00pm"). Do not try to find the date.
+4. Return a valid JSON object with this structure:
+{
+  "events": [
+    {
+      "film_title": "Title",
+      "showtime": "7:00pm",
+      "is_special_event": true,
+      "special_guest": "Name or None",
+      "format": "Format or None",
+      "description": "Short snippet explaining why it's special"
+    }
+  ]
+}
+"""
             },
             {
                 "role": "user",
